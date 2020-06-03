@@ -410,7 +410,9 @@ func (app *App) startGRPCServer(lis net.Listener) error {
 
 func (app *App) startHTTPServer(ctx context.Context, lis net.Listener) error {
 	gatewayMux := runtime.NewServeMux(
-		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{EmitDefaults: true}))
+		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{EmitDefaults: true}),
+		runtime.WithMetadata(methodHTTPRequest),
+	)
 	opts := []grpc.DialOption{grpc.WithInsecure()}
 
 	if err := api.RegisterPodiumHandlerFromEndpoint(ctx, gatewayMux, app.GRPCEndpoint, opts); err != nil {

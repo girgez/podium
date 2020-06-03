@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/getsentry/raven-go"
@@ -22,9 +23,11 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	"github.com/grpc-ecosystem/go-grpc-middleware/util/metautils"
 )
 
 type newRelicContextKey struct {
@@ -36,6 +39,12 @@ func (app *App) noAuthMiddleware(ctx context.Context, req interface{}, info *grp
 }
 
 func (app *App) basicAuthMiddleware(ctx context.Context) (context.Context, error) {
+	isSecureGetRequest := !app.Config.GetBool("notsecure.get.request")
+	method := metautils.ExtractIncoming(ctx).Get("req.method")
+	if !isSecureGetRequest && method == "get" {
+		return ctx, nil
+	}
+
 	token, err := grpc_auth.AuthFromMD(ctx, "basic")
 	if err != nil {
 		return nil, err
@@ -196,4 +205,8 @@ func (m *removeTrailingSlashMiddleware) removeTrailingSlash(path string) string 
 func (m removeTrailingSlashMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.URL.Path = m.removeTrailingSlash(r.URL.Path)
 	m.Handler.ServeHTTP(w, r)
+}
+
+func methodHTTPRequest(ctx context.Context, r *http.Request) metadata.MD {
+	return metadata.Pairs("req.method", strings.ToLower(r.Method))
 }
