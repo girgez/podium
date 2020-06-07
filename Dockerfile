@@ -6,13 +6,11 @@
 
 FROM alpine:3.9
 
-MAINTAINER TFG Co <backend@tfgco.com>
-
-EXPOSE 80
-EXPOSE 81
+EXPOSE 8880
+EXPOSE 8881
 
 RUN apk add bash
-ADD bin/podium-linux-x86_64 /go/bin/podium
+ADD ./bin/podium /go/bin/podium
 RUN chmod +x /go/bin/podium
 
 RUN mkdir -p /home/podium/
@@ -25,5 +23,6 @@ ENV PODIUM_REDIS_DB 0
 ENV PODIUM_SENTRY_URL ""
 ENV PODIUM_BASICAUTH_USERNAME ""
 ENV PODIUM_BASICAUTH_PASSWORD ""
+ENV PODIUM_NOTSECURE_GET_REQUEST "true"
 
-CMD /go/bin/podium start -c /home/podium/default.yaml -p 80 -g 81
+CMD ["/go/bin/podium", "start", "-c", "/home/podium/default.yaml", "-p", "8880", "-g" ,"8881"]
