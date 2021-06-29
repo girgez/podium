@@ -24,9 +24,12 @@ import (
 	"github.com/getsentry/raven-go"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/rcrowley/go-metrics"
+	uuid "github.com/satori/go.uuid"
 	"github.com/spf13/viper"
 	"github.com/topfreegames/extensions/jaeger"
-	"github.com/topfreegames/podium/leaderboard"
+	"github.com/topfreegames/podium/leaderboard/v2/database"
+	"github.com/topfreegames/podium/leaderboard/v2/service"
+	lservice "github.com/topfreegames/podium/leaderboard/v2/service"
 	"github.com/topfreegames/podium/log"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -59,15 +62,16 @@ type App struct {
 	grpcServer   *grpc.Server
 	httpServer   *http.Server
 	Config       *viper.Viper
-	Logger       zap.Logger
-	Leaderboards *leaderboard.Client
+	Logger       *zap.Logger
+	Leaderboards lservice.Leaderboard
 	NewRelic     newrelic.Application
 	DDStatsD     *extnethttpmiddleware.DogStatsD
+	ID           uuid.UUID
 }
 
 // New returns a new podium Application.
 // If httpPort is sent as zero, a random port will be selected (the same will happen for grpcPort)
-func New(host string, httpPort, grpcPort int, configPath string, debug bool, logger zap.Logger) (*App, error) {
+func New(host string, httpPort, grpcPort int, configPath string, debug bool, logger *zap.Logger) (*App, error) {
 	app := &App{
 		HTTPEndpoint: fmt.Sprintf("%s:%d", host, httpPort),
 		GRPCEndpoint: fmt.Sprintf("%s:%d", host, grpcPort),
@@ -77,6 +81,7 @@ func New(host string, httpPort, grpcPort int, configPath string, debug bool, log
 		Config:       viper.New(),
 		Debug:        debug,
 		Logger:       logger,
+		ID:           uuid.NewV4(),
 	}
 	err := app.configure()
 	if err != nil {
@@ -228,16 +233,17 @@ func (app *App) configureJaeger() {
 
 func (app *App) setConfigurationDefaults() {
 	app.Config.SetDefault("healthcheck.workingText", "WORKING")
-	app.Config.SetDefault("graceperiod.ms", 5000)
+	app.Config.SetDefault("graceperiod.ms", 50)
 	app.Config.SetDefault("api.maxReturnedMembers", 2000)
 	app.Config.SetDefault("api.maxReadBufferSize", 32000)
 	app.Config.SetDefault("redis.host", "localhost")
-	app.Config.SetDefault("redis.port", 1212)
+	app.Config.SetDefault("redis.port", 6379)
 	app.Config.SetDefault("redis.password", "")
 	app.Config.SetDefault("redis.db", 0)
 	app.Config.SetDefault("redis.connectionTimeout", 200)
 	app.Config.SetDefault("jaeger.disabled", true)
 	app.Config.SetDefault("jaeger.samplingProbability", 0.001)
+	app.Config.SetDefault("redis.cluster.enabled", false)
 }
 
 func (app *App) loadConfiguration() error {
@@ -259,7 +265,7 @@ func (app *App) loadConfiguration() error {
 func (app *App) OnErrorHandler(err error, stack []byte) {
 	app.Logger.Error(
 		"Panic occurred.",
-		zap.Object("panicText", err),
+		zap.Any("panicText", err),
 		zap.String("stack", string(stack)),
 	)
 
@@ -271,10 +277,6 @@ func (app *App) OnErrorHandler(err error, stack []byte) {
 }
 
 func (app *App) configureApplication() error {
-	l := app.Logger.With(
-		zap.String("operation", "configureApplication"),
-	)
-
 	app.Errors = metrics.NewEWMA15()
 
 	go func() {
@@ -282,26 +284,54 @@ func (app *App) configureApplication() error {
 		time.Sleep(5 * time.Second)
 	}()
 
-	host := app.Config.GetString("redis.host")
-	port := app.Config.GetInt("redis.port")
-	password := app.Config.GetString("redis.password")
-	db := app.Config.GetInt("redis.db")
-	connectionTimeout := app.Config.GetInt("redis.connectionTimeout")
-
-	rl := l.With(
-		zap.String("url", fmt.Sprintf("redis://:<REDACTED>@%s:%v/%v", host, port, db)),
-		zap.Int("connectionTimeout", connectionTimeout),
-	)
-
-	rl.Info("Creating leaderboard client.")
-	cli, err := leaderboard.NewClient(host, port, password, db, connectionTimeout)
+	client, err := app.createAndConfigureLeaderboardClient()
 	if err != nil {
 		return err
 	}
-	app.Leaderboards = cli
-	rl.Info("Leaderboard client creation successfull.")
+	app.Leaderboards = client
 
 	return nil
+}
+
+func (app *App) createAndConfigureLeaderboardClient() (lservice.Leaderboard, error) {
+	client := app.createLeaderboardClient()
+	err := client.Healthcheck(context.Background())
+
+	if err != nil {
+		return nil, err
+	}
+
+	app.Logger.Info("Leaderboard client creation successfull.")
+	return client, nil
+}
+
+func (app *App) createLeaderboardClient() lservice.Leaderboard {
+	shouldRunOnCluster := app.Config.GetBool("redis.cluster.enabled")
+	addrs := app.Config.GetStringSlice("redis.addrs")
+	password := app.Config.GetString("redis.password")
+	host := app.Config.GetString("redis.host")
+	port := app.Config.GetInt("redis.port")
+	db := app.Config.GetInt("redis.db")
+
+	logger := app.Logger.With(
+		zap.String("operation", "createLeaderboardClient"),
+		zap.Strings("addrs", addrs),
+		zap.Bool("cluster", shouldRunOnCluster),
+		zap.String("url", fmt.Sprintf("redis://:<REDACTED>@%s:%v/%v", host, port, db)),
+	)
+
+	leaderboardService := service.NewService(database.NewRedisDatabase(database.RedisOptions{
+		ClusterEnabled: shouldRunOnCluster,
+		Addrs:          addrs,
+		Host:           host,
+		Password:       password,
+		Port:           port,
+		DB:             db,
+	}))
+
+	logger.Info("Creating leaderboard client.")
+
+	return leaderboardService
 }
 
 //AddError rate statistics
@@ -371,6 +401,7 @@ func (app *App) Start(ctx context.Context) error {
 		app.GracefullStop()
 		time.Sleep(time.Duration(graceperiod) * time.Millisecond)
 	case err := <-errch:
+		app.Logger.Error("Err on start server", zap.Error(err))
 		return err
 	case <-stopped:
 	}
@@ -455,7 +486,7 @@ func (app *App) WaitForReady(d time.Duration) error {
 	return fmt.Errorf("timed out waiting for endpoints")
 }
 
-// GracefulStop attempts to stop the server.
+// GracefullStop attempts to stop the server.
 func (app *App) GracefullStop() {
 	if app.grpcServer != nil {
 		app.grpcServer.GracefulStop()

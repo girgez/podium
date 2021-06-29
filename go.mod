@@ -1,72 +1,52 @@
-module girgez/podium
+module github.com/topfreegames/podium
 
-go 1.14
+go 1.15
 
 require (
-	cloud.google.com/go v0.26.0
-	github.com/DataDog/datadog-go v0.0.0-20170427165718-0ddda6bee211
-	github.com/apache/thrift v0.0.0-20161221203622-b2a4d4ae21c7
-	github.com/asaskevich/govalidator v0.0.0-20180315120708-ccb8e960c48f
-	github.com/bsm/redis-lock v6.0.0+incompatible
-	github.com/certifi/gocertifi v0.0.0-20160926115448-a61bf5eafa3a
-	github.com/codahale/hdrhistogram v0.0.0-20161010025455-3a0bb77429bd
-	github.com/fsnotify/fsnotify v1.4.7
-	github.com/getsentry/raven-go v0.0.0-20160908232054-379f8d0a68ca
-	github.com/go-pg/pg v6.12.0+incompatible
-	github.com/go-redis/redis v6.12.0+incompatible
-	github.com/golang/mock v1.1.1
-	github.com/golang/protobuf v1.3.1
-	github.com/gorilla/context v0.0.0-20160226214623-1ea25387ff6f
-	github.com/gorilla/mux v1.6.1
-	github.com/gosuri/uilive v0.0.0-20160202011846-efb88ccd0599
+	github.com/DataDog/datadog-go v4.5.1+incompatible // indirect
+	github.com/HdrHistogram/hdrhistogram-go v1.1.0 // indirect
+	github.com/Microsoft/go-winio v0.5.0 // indirect
+	github.com/asaskevich/govalidator v0.0.0-20180315120708-ccb8e960c48f // indirect
+	github.com/bsm/redis-lock v6.0.0+incompatible // indirect
+	github.com/certifi/gocertifi v0.0.0-20200922220541-2c3bb06c6054 // indirect
+	github.com/getsentry/raven-go v0.0.0-20170918144728-1452f6376ddb
+	github.com/go-pg/pg v8.0.7+incompatible // indirect
+	github.com/go-redis/redis v6.13.2+incompatible // indirect
+	github.com/gogo/protobuf v1.3.1 // indirect
+	github.com/golang/protobuf v1.4.3
+	github.com/gorilla/context v0.0.0-20160226214623-1ea25387ff6f // indirect
+	github.com/gorilla/mux v1.6.1 // indirect
+	github.com/gosuri/uilive v0.0.0-20160202011846-efb88ccd0599 // indirect
 	github.com/gosuri/uiprogress v0.0.0-20160202012259-a9f819bfc744
 	github.com/grpc-ecosystem/go-grpc-middleware v1.0.0
 	github.com/grpc-ecosystem/grpc-gateway v1.9.2
-	github.com/hashicorp/hcl v1.0.0
-	github.com/inconshreveable/mousetrap v1.0.0
-	github.com/jinzhu/inflection v0.0.0-20180308033659-04140366298a
-	github.com/klauspost/compress v0.0.0-20160919184342-d0763f13d86e
-	github.com/klauspost/cpuid v0.0.0-20160302075316-09cded8978dc
-	github.com/klauspost/crc32 v0.0.0-20160219142609-19b0b332c9e4
-	github.com/kr/fs v0.0.0-20131111012553-2788f0dbd169
-	github.com/magiconair/properties v1.8.0
-	github.com/mailru/easyjson v0.0.0-20180307130605-4a8a4c12c4d1
-	github.com/mattn/go-isatty v0.0.0-20160806122752-66b8e73f3f5c
-	github.com/mitchellh/mapstructure v1.1.2
+	github.com/jinzhu/inflection v0.0.0-20180308033659-04140366298a // indirect
+	github.com/klauspost/compress v0.0.0-20160919184342-d0763f13d86e // indirect
+	github.com/klauspost/cpuid v0.0.0-20160302075316-09cded8978dc // indirect
+	github.com/klauspost/crc32 v0.0.0-20160219142609-19b0b332c9e4 // indirect
+	github.com/mailru/easyjson v0.0.0-20180320131758-517203d186eb
 	github.com/newrelic/go-agent v1.11.0
-	github.com/onsi/ginkgo v1.2.1-0.20160926211803-45a5f6ffb2a1
-	github.com/onsi/gomega v0.0.0-20160911051023-d59fa0ac68bb
-	github.com/opentracing/opentracing-go v1.0.2
-	github.com/pelletier/go-toml v1.2.0
-	github.com/pkg/errors v0.8.1-0.20161002052512-839d9e913e06
-	github.com/pkg/sftp v0.0.0-20160930220758-4d0e916071f6
-	github.com/rcrowley/go-metrics v0.0.0-20160921195207-ab2277b1c5d1
+	github.com/onsi/ginkgo v1.16.2
+	github.com/onsi/gomega v1.11.0
+	github.com/opentracing/opentracing-go v1.2.0 // indirect
+	github.com/rcrowley/go-metrics v0.0.0-20180125231941-8732c616f529
 	github.com/satori/go.uuid v1.2.0
-	github.com/sirupsen/logrus v1.0.5
-	github.com/spf13/afero v1.1.2
-	github.com/spf13/cast v1.3.0
-	github.com/spf13/cobra v0.0.0-20160830174925-9c28e4bbd74e
-	github.com/spf13/jwalterweatherman v1.0.0
-	github.com/spf13/pflag v1.0.3
-	github.com/spf13/viper v1.3.1
+	github.com/spf13/cobra v0.0.6
+	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/spf13/viper v1.7.1
 	github.com/topfreegames/extensions v8.0.2+incompatible
-	github.com/topfreegames/podium v0.0.0-00010101000000-000000000000
-	github.com/uber-go/atomic v1.0.0
-	github.com/uber/jaeger-client-go v2.11.2+incompatible
-	github.com/uber/jaeger-lib v1.4.0
-	github.com/valyala/bytebufferpool v1.0.0
+	github.com/topfreegames/podium/leaderboard/v2 v2.0.0
+	github.com/uber/jaeger-client-go v2.25.0+incompatible // indirect
+	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
+	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v0.0.0-20161005094451-07f692d02d61
-	go.uber.org/zap v0.0.0-20160929230216-c4939d1166b2
-	golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2
-	golang.org/x/net v0.0.0-20190619014844-b5b0513f8c1b
-	golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be
-	golang.org/x/sys v0.0.0-20190626221950-04f50cda93cb
-	golang.org/x/text v0.3.2
-	google.golang.org/appengine v1.4.0
-	google.golang.org/genproto v0.0.0-20190611190212-a7e196e89fd3
-	google.golang.org/grpc v1.21.1
-	gopkg.in/jarcoal/httpmock.v1 v1.0.0-20180304133419-61bcb58a0752
-	gopkg.in/yaml.v2 v2.2.2
+	go.uber.org/zap v1.16.0
+	golang.org/x/lint v0.0.0-20200302205851-738671d3881b // indirect
+	golang.org/x/sys v0.0.0-20210521090106-6ca3eb03dfc2 // indirect
+	golang.org/x/tools v0.1.1 // indirect
+	google.golang.org/genproto v0.0.0-20200311144346-b662892dd51b
+	google.golang.org/grpc v1.28.0
+	mellium.im/sasl v0.2.1 // indirect
 )
 
-replace github.com/topfreegames/podium => ./
+replace github.com/topfreegames/podium/leaderboard/v2 v2.0.0 => ./leaderboard

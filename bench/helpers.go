@@ -15,15 +15,25 @@ import (
 	"io/ioutil"
 	"net/http"
 
-	"github.com/spf13/viper"
+	. "github.com/onsi/gomega"
 	"github.com/topfreegames/extensions/redis"
-	"github.com/topfreegames/podium/leaderboard"
+	"github.com/topfreegames/podium/config"
+	"github.com/topfreegames/podium/leaderboard/v2/database"
+	"github.com/topfreegames/podium/leaderboard/v2/service"
 )
 
 func getRedis() *redis.Client {
-	config := viper.New()
-	config.Set("redis.url", "redis://localhost:1224/0")
-	config.Set("redis.connectionTimeout", 200)
+	config, err := config.GetDefaultConfig("../config/default.yaml")
+	Expect(err).NotTo(HaveOccurred())
+
+	redisHost := config.GetString("redis.host")
+	redisPort := config.GetInt("redis.port")
+	redisDB := config.GetInt("redis.db")
+
+	redisURL := fmt.Sprintf("redis://%s:%d/%d", redisHost, redisPort, redisDB)
+
+	config.SetDefault("redis.url", redisURL)
+	config.SetDefault("redis.connectionTimeout", 200)
 
 	redisClient, err := redis.NewClient("redis", config)
 	if err != nil {
@@ -98,7 +108,19 @@ func validateResp(statusCode int, body string, err error) {
 }
 
 func generateNMembers(amount int) string {
-	client := leaderboard.NewClientWithRedis(getRedis())
+	config, err := config.GetDefaultConfig("../config/default.yaml")
+	Expect(err).NotTo(HaveOccurred())
+
+	client := service.NewService(
+		database.NewRedisDatabase(database.RedisOptions{
+			ClusterEnabled: config.GetBool("redis.clusterEnabled"),
+			Addrs:          config.GetStringSlice("redis.addrs"),
+			Host:           config.GetString("redis.host"),
+			Port:           config.GetInt("redis.port"),
+			Password:       config.GetString("redis.password"),
+			DB:             config.GetInt("redis.db"),
+		}),
+	)
 
 	lbID := "leaderboard-0"
 

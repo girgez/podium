@@ -2,8 +2,11 @@ healthcheck:
   workingText: WORKING
 
 redis:
+  cluster:
+    enabled: false
+  addrs: "localhost:5000"
   host: localhost
-  port: 1212
+  port: 6379
   password: ""
   db: 0
   connectionTimeout: 200

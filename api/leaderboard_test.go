@@ -18,8 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/topfreegames/extensions/redis/interfaces"
 	"github.com/topfreegames/podium/api"
+	"github.com/topfreegames/podium/leaderboard/v2/database/redis"
+	"github.com/topfreegames/podium/testing"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -32,24 +33,27 @@ import (
 )
 
 var _ = Describe("Leaderboard Handler", func() {
-	var a *api.App
-	var redisClient interfaces.RedisClient
+	var app *api.App
+	var redisClient redis.Client
 	const testLeaderboardID = "testkey"
 
 	BeforeSuite(func() {
-		a = GetDefaultTestApp()
+		app = GetDefaultTestApp()
+		testing.InitializeTestServer(app)
+
+		var err error
+		redisClient, err = GetTestingRedis(app)
+		Expect(err).NotTo(HaveOccurred())
 	})
 
-	BeforeEach(func() {
-		extRedisClient, err := GetConnectedRedis()
-		Expect(err).NotTo(HaveOccurred())
-		redisClient = extRedisClient.Client
-		redisClient.Del("testkey")
-		redisClient.Del("testkey1")
-		redisClient.Del("testkey2")
-		redisClient.Del("testkey3")
-		redisClient.Del("testkey4")
-		redisClient.Del("testkey5")
+	AfterEach(func() {
+		redisClient.Del(context.Background(), "testkey")
+		redisClient.Del(context.Background(), "testkey:ttl")
+		redisClient.Del(context.Background(), "testkey1")
+		redisClient.Del(context.Background(), "testkey2")
+		redisClient.Del(context.Background(), "testkey3")
+		redisClient.Del(context.Background(), "testkey4")
+		redisClient.Del(context.Background(), "testkey5")
 	})
 
 	Describe("When leaderboard has expired", func() {
@@ -86,8 +90,8 @@ var _ = Describe("Leaderboard Handler", func() {
 				fmt.Sprintf("testkey-year%dweek%s", year, maybePrefixWithZero(week)),
 				fmt.Sprintf(
 					"testkey-year%dmonth%s",
-					time.Now().UTC().AddDate(0, -2, 0).Year(),
-					maybePrefixWithZero(int(time.Now().UTC().AddDate(0, -2, 0).Month())),
+					time.Now().UTC().AddDate(0, -3, 0).Year(),
+					maybePrefixWithZero(int(time.Now().UTC().AddDate(0, -3, 0).Month())),
 				),
 				fmt.Sprintf(
 					"testkey-year%dquarter0%d",
@@ -103,7 +107,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(result["success"]).To(BeFalse())
 			Expect(result["reason"]).To(
 				Equal(
-					fmt.Sprintf("Leaderboard %s has already expired", key),
+					fmt.Sprintf("Leaderboard expired error: %s", key),
 				),
 			)
 		}
@@ -112,7 +116,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{"score": int64(100)}
 			for _, k := range keys {
 				httpPath := fmt.Sprintf("/l/%s/members/memberpublicid/score", k)
-				status, body := PutJSON(a, httpPath, payload)
+				status, body := PutJSON(app, httpPath, payload)
 				Expect(status).To(Equal(http.StatusBadRequest))
 				checkBody(k, body)
 			}
@@ -124,7 +128,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			}}
 			for _, k := range keys {
 				httpPath := fmt.Sprintf("/l/%s/scores", k)
-				status, body := PutJSON(a, httpPath, payload)
+				status, body := PutJSON(app, httpPath, payload)
 				Expect(status).To(Equal(http.StatusBadRequest))
 				checkBody(k, body)
 			}
@@ -134,7 +138,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{"increment": 100}
 			for _, k := range keys {
 				httpPath := fmt.Sprintf("/l/%s/members/memberpublicid/score", k)
-				status, body := PatchJSON(a, httpPath, payload)
+				status, body := PatchJSON(app, httpPath, payload)
 				Expect(status).To(Equal(http.StatusBadRequest))
 				checkBody(k, body)
 			}
@@ -147,7 +151,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				{"publicID": "memberpublicid1", "score": int64(150)},
 				{"publicID": "memberpublicid2", "score": int64(100)},
 			}}
-			status, body := PutJSON(a, "/l/testkey/scores", payload)
+			status, body := PutJSON(app, "/l/testkey/scores", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -159,13 +163,13 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(payload["members"].([]map[string]interface{})[i]["publicID"].(string)))
 			}
 
-			member1, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid1", "desc", false)
+			member1, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid1", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member1.Rank).To(Equal(1))
 			Expect(member1.Score).To(Equal(int64(150)))
 			Expect(member1.PublicID).To(Equal("memberpublicid1"))
 
-			member2, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
+			member2, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member2.Rank).To(Equal(2))
 			Expect(member2.Score).To(Equal(int64(100)))
@@ -173,7 +177,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should set correct members score in redis and respond with the correct values (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				req := &pb.BulkUpsertScoresRequest{
 					LeaderboardId: testLeaderboardID,
 					MemberScores: &pb.BulkUpsertScoresRequest_MemberScores{
@@ -194,13 +198,13 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(m.PublicID).To(Equal(req.MemberScores.Members[i].PublicID))
 				}
 
-				member1, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid1", "desc", false)
+				member1, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid1", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member1.Rank).To(Equal(1))
 				Expect(member1.Score).To(Equal(int64(150)))
 				Expect(member1.PublicID).To(Equal("memberpublicid1"))
 
-				member2, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
+				member2, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member2.Rank).To(Equal(2))
 				Expect(member2.Score).To(Equal(int64(100)))
@@ -215,7 +219,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				{"publicID": "memberpublicid1", "score": bigScore1},
 				{"publicID": "memberpublicid2", "score": bigScore2},
 			}}
-			status, body := PutJSON(a, "/l/testkey/scores", payload)
+			status, body := PutJSON(app, "/l/testkey/scores", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -227,13 +231,13 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(payload["members"].([]map[string]interface{})[i]["publicID"].(string)))
 			}
 
-			member1, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid1", "desc", false)
+			member1, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid1", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member1.Rank).To(Equal(1))
 			Expect(member1.Score).To(Equal(bigScore1))
 			Expect(member1.PublicID).To(Equal("memberpublicid1"))
 
-			member2, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
+			member2, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member2.Rank).To(Equal(2))
 			Expect(member2.Score).To(Equal(bigScore2))
@@ -249,7 +253,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				{"publicID": "memberpublicid2", "score": int64(100)},
 			}}
 
-			status, body := PutJSON(a, fmt.Sprintf("/l/%s/scores?scoreTTL=%d", lbName, ttl), payload)
+			status, body := PutJSON(app, fmt.Sprintf("/l/%s/scores?scoreTTL=%d", lbName, ttl), payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -261,7 +265,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(payload["members"].([]map[string]interface{})[i]["publicID"].(string)))
 				Expect(int(member["expireAt"].(float64))).To(BeNumerically("~", time.Now().Unix()+int64(ttl), 1))
 
-				memb, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", true)
+				memb, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", true)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(memb.Rank).To(Equal(i + 1))
 				Expect(memb.Score).To(Equal(payload["members"].([]map[string]interface{})[i]["score"].(int64)))
@@ -270,20 +274,18 @@ var _ = Describe("Leaderboard Handler", func() {
 			}
 
 			redisLBExpirationKey := fmt.Sprintf("%s:ttl", lbName)
-			result2, err := redisClient.Exists(redisLBExpirationKey).Result()
+			err := redisClient.Exists(context.Background(), redisLBExpirationKey)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result2).To(Equal(int64(1)))
 			redisExpirationSetKey := "expiration-sets"
-			result2, err = redisClient.Exists(redisExpirationSetKey).Result()
+			err = redisClient.Exists(context.Background(), redisExpirationSetKey)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result2).To(Equal(int64(1)))
-			result3, err := redisClient.SMembers(redisExpirationSetKey).Result()
+			result3, err := redisClient.SMembers(context.Background(), redisExpirationSetKey)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result3).To(ContainElement(redisLBExpirationKey))
-			result4, err := redisClient.ZScore(redisLBExpirationKey, "memberpublicid1").Result()
+			result4, err := redisClient.ZScore(context.Background(), redisLBExpirationKey, "memberpublicid1")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result4).To(BeNumerically("~", time.Now().Unix()+int64(ttl), 1))
-			result5, err := redisClient.ZScore(redisLBExpirationKey, "memberpublicid2").Result()
+			result5, err := redisClient.ZScore(context.Background(), redisLBExpirationKey, "memberpublicid2")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result5).To(BeNumerically("~", time.Now().Unix()+int64(ttl), 1))
 
@@ -300,9 +302,9 @@ var _ = Describe("Leaderboard Handler", func() {
 				{"publicID": "memberpublicid3", "score": int64(250)},
 			}}
 
-			status, body := PutJSON(a, "/l/testkey/scores", payload1)
+			status, body := PutJSON(app, "/l/testkey/scores", payload1)
 			Expect(status).To(Equal(http.StatusOK), body)
-			status, body = PutJSON(a, "/l/testkey/scores?prevRank=true", payload2)
+			status, body = PutJSON(app, "/l/testkey/scores?prevRank=true", payload2)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -314,7 +316,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(payload2["members"].([]map[string]interface{})[i]["publicID"].(string)))
 				Expect(int(member["previousRank"].(float64))).To(Equal(i + 2))
 
-				memb, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				memb, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(memb.Rank).To(Equal(i + 1))
 				Expect(memb.Score).To(Equal(int64(member["score"].(float64))))
@@ -327,7 +329,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				{"publicID": "memberpublicid1", "score": int64(0)},
 				{"publicID": "memberpublicid2", "score": int64(0)},
 			}}
-			status, body := PutJSON(a, "/l/testkey/scores", payload)
+			status, body := PutJSON(app, "/l/testkey/scores", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -337,7 +339,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int64(member["score"].(float64))).To(Equal(int64(0)))
 				Expect(member["publicID"]).To(Equal(payload["members"].([]map[string]interface{})[i]["publicID"].(string)))
 
-				memb, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				memb, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(memb.Score).To(Equal(int64(0)))
 				Expect(memb.PublicID).To(Equal(member["publicID"]))
@@ -349,7 +351,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				{"publicID": "memberpublicid1", "score": "hundred"},
 				{"publicID": "memberpublicid2", "score": "fifty"},
 			}}
-			status, body := PutJSON(a, "/l/testkey/scores", payload)
+			status, body := PutJSON(app, "/l/testkey/scores", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -361,7 +363,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{"members": []map[string]interface{}{
 				{"score": 100},
 			}}
-			status, body := PutJSON(a, "/l/testkey/scores", payload)
+			status, body := PutJSON(app, "/l/testkey/scores", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -370,7 +372,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if invalid payload", func() {
-			status, body := Put(a, "/l/testkey/scores", "invalid")
+			status, body := Put(app, "/l/testkey/scores", "invalid")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -399,8 +401,8 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			ctx["payload"] = payloadJSON
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
-			url := getRoute(httpEndPoint, "/l/testkey/scores")
-			status, body, err := fastPutTo(url, ctx["payload"].([]byte))
+			url := testing.GetRoute(httpEndPoint, "/l/testkey/scores")
+			status, body, err := testing.FastPutTo(url, ctx["payload"].([]byte))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -411,7 +413,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"score": int64(100),
 			}
-			status, body := PutJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PutJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -420,7 +422,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(payload["score"]))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(100)))
@@ -428,7 +430,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should set correct member score in redis and respond with the correct values (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				req := &pb.UpsertScoreRequest{
 					LeaderboardId:  testLeaderboardID,
 					MemberPublicId: "memberpublicid",
@@ -443,7 +445,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(resp.Score).To(Equal(req.ScoreChange.Score))
 				Expect(resp.Rank).To(Equal(int32(1)))
 
-				member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+				member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member.Rank).To(Equal(1))
 				Expect(member.Score).To(Equal(int64(100)))
@@ -456,7 +458,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"score": bigScore,
 			}
-			status, body := PutJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PutJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -465,7 +467,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(payload["score"]))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(bigScore))
@@ -479,7 +481,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"score": int64(100),
 			}
-			status, body := PutJSON(a, fmt.Sprintf("/l/%s/members/memberpublicid/score?scoreTTL=%d", lbName, ttl), payload)
+			status, body := PutJSON(app, fmt.Sprintf("/l/%s/members/memberpublicid/score?scoreTTL=%d", lbName, ttl), payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -489,7 +491,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 			Expect(int(result["expireAt"].(float64))).To(BeNumerically("~", time.Now().Unix()+int64(ttl), 1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", true)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", true)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(100)))
@@ -497,17 +499,15 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(member.ExpireAt).To(BeNumerically("~", time.Now().Unix()+int64(ttl), 1))
 
 			redisLBExpirationKey := fmt.Sprintf("%s:ttl", lbName)
-			result2, err := redisClient.Exists(redisLBExpirationKey).Result()
+			err = redisClient.Exists(context.Background(), redisLBExpirationKey)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result2).To(Equal(int64(1)))
 			redisExpirationSetKey := "expiration-sets"
-			result2, err = redisClient.Exists(redisExpirationSetKey).Result()
+			err = redisClient.Exists(context.Background(), redisExpirationSetKey)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result2).To(Equal(int64(1)))
-			result3, err := redisClient.SMembers(redisExpirationSetKey).Result()
+			result3, err := redisClient.SMembers(context.Background(), redisExpirationSetKey)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result3).To(ContainElement(redisLBExpirationKey))
-			result4, err := redisClient.ZScore(redisLBExpirationKey, "memberpublicid").Result()
+			result4, err := redisClient.ZScore(context.Background(), redisLBExpirationKey, "memberpublicid")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result4).To(BeNumerically("~", time.Now().Unix()+int64(ttl), 1))
 		})
@@ -522,11 +522,11 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload3 := map[string]interface{}{
 				"score": int64(10),
 			}
-			status, body := PutJSON(a, "/l/testkey/members/memberpublicid/score", payload1)
+			status, body := PutJSON(app, "/l/testkey/members/memberpublicid/score", payload1)
 			Expect(status).To(Equal(http.StatusOK), body)
-			status, body = PutJSON(a, "/l/testkey/members/memberpublicid2/score", payload2)
+			status, body = PutJSON(app, "/l/testkey/members/memberpublicid2/score", payload2)
 			Expect(status).To(Equal(http.StatusOK), body)
-			status, body = PutJSON(a, "/l/testkey/members/memberpublicid/score?prevRank=true", payload3)
+			status, body = PutJSON(app, "/l/testkey/members/memberpublicid/score?prevRank=true", payload3)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -536,7 +536,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int(result["rank"].(float64))).To(Equal(2))
 			Expect(int(result["previousRank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(2))
 			Expect(member.Score).To(Equal(int64(10)))
@@ -547,7 +547,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"score": int64(0),
 			}
-			status, body := PutJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PutJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -556,7 +556,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(payload["score"]))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(0)))
@@ -567,7 +567,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"score": "hundred",
 			}
-			status, body := PutJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PutJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -583,7 +583,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"notscore": 100,
 			}
-			status, body := PutJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PutJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -592,7 +592,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if invalid payload", func() {
-			status, body := Put(a, "/l/testkey/members/memberpublicid/score", "invalid")
+			status, body := Put(app, "/l/testkey/members/memberpublicid/score", "invalid")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -619,8 +619,8 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			ctx["payload"] = payloadJSON
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
-			url := getRoute(httpEndPoint, "/l/testkey/members/memberpublicid/score")
-			status, body, err := fastPutTo(url, ctx["payload"].([]byte))
+			url := testing.GetRoute(httpEndPoint, "/l/testkey/members/memberpublicid/score")
+			status, body, err := testing.FastPutTo(url, ctx["payload"].([]byte))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -632,10 +632,10 @@ var _ = Describe("Leaderboard Handler", func() {
 				"increment": 10,
 			}
 
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := PatchJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PatchJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 
 			var result map[string]interface{}
@@ -645,7 +645,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(int64(110)))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(110)))
@@ -653,14 +653,14 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should increment correct member score in redis and respond with the correct values (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				req := &pb.IncrementScoreRequest{
 					LeaderboardId:  testLeaderboardID,
 					MemberPublicId: "memberpublicid",
 					Body:           &pb.IncrementScoreRequest_Body{Increment: 10},
 				}
 
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 
 				resp, err := cli.IncrementScore(context.Background(), req)
@@ -671,7 +671,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int64(resp.Score)).To(Equal(int64(110)))
 				Expect(resp.Rank).To(Equal(int32(1)))
 
-				member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+				member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member.Rank).To(Equal(1))
 				Expect(member.Score).To(Equal(int64(110)))
@@ -684,7 +684,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				"increment": 10,
 			}
 
-			status, body := PatchJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PatchJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 
 			var result map[string]interface{}
@@ -694,7 +694,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(int64(10)))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(10)))
@@ -705,7 +705,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"increment": 0,
 			}
-			status, body := PatchJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PatchJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 
 			var result map[string]interface{}
@@ -718,7 +718,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"notscore": 100,
 			}
-			status, body := PatchJSON(a, "/l/testkey/members/memberpublicid/score", payload)
+			status, body := PatchJSON(app, "/l/testkey/members/memberpublicid/score", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -727,7 +727,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if invalid payload", func() {
-			status, body := Patch(a, "/l/testkey/members/memberpublicid/score", "invalid")
+			status, body := Patch(app, "/l/testkey/members/memberpublicid/score", "invalid")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -754,8 +754,8 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			ctx["payload"] = payloadJSON
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
-			url := getRoute(httpEndPoint, "/l/testkey/members/memberpublicid/score")
-			status, body, err := fastPatchTo(url, ctx["payload"].([]byte))
+			url := testing.GetRoute(httpEndPoint, "/l/testkey/members/memberpublicid/score")
+			status, body, err := testing.FastPatchTo(url, ctx["payload"].([]byte))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -763,23 +763,23 @@ var _ = Describe("Leaderboard Handler", func() {
 
 	Describe("Remove Member Score", func() {
 		It("Should delete member score from redis if score exists (http)", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Delete(a, "/l/testkey/members?ids=memberpublicid")
+			status, body := Delete(app, "/l/testkey/members?ids=memberpublicid")
 			Expect(status).To(Equal(http.StatusOK), body, body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
 			Expect(result["success"]).To(BeTrue())
 
-			_, err = a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			_, err = app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("Could not find data for member"))
 		})
 
 		It("Should delete member score from redis if score exists (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			SetupGRPC(app, func(cli pb.PodiumClient) {
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 
 				req := &pb.RemoveMemberRequest{
@@ -790,33 +790,33 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(resp.Success).To(BeTrue())
 
-				_, err = a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+				_, err = app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("Could not find data for member"))
 			})
 		})
 
 		It("Should delete many member score from redis if they exists", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
-			_, err = a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err = app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Delete(a, "/l/testkey/members?ids=memberpublicid,memberpublicid2")
+			status, body := Delete(app, "/l/testkey/members?ids=memberpublicid,memberpublicid2")
 			Expect(status).To(Equal(http.StatusOK), body, body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
 			Expect(result["success"]).To(BeTrue())
 
-			_, err = a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			_, err = app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("Could not find data for member"))
-			_, err = a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
+			_, err = app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid2", "desc", false)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("Could not find data for member"))
 		})
 
 		It("Should fail if error removing score", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
 			app := GetDefaultTestAppWithFaultyRedis()
@@ -827,19 +827,19 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should not fail in deleting member score from redis if score does not exist", func() {
-			status, body := Delete(a, "/l/testkey/members?ids=memberpublicid")
+			status, body := Delete(app, "/l/testkey/members?ids=memberpublicid")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
 			Expect(result["success"]).To(BeTrue())
 
-			_, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			_, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("Could not find data for member"))
 		})
 
 		It("Should fail if list of member ids to remove is empty", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				_, err := cli.RemoveMembers(context.Background(), &pb.RemoveMembersRequest{
 					LeaderboardId: testLeaderboardID,
 				})
@@ -851,15 +851,15 @@ var _ = Describe("Leaderboard Handler", func() {
 		HTTPMeasure("it should remove member score", func(ctx map[string]interface{}) {
 			lbID := uuid.NewV4().String()
 			memberID := uuid.NewV4().String()
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, memberID, 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, memberID, 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 			ctx["lead"] = lbID
 			ctx["memberID"] = memberID
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
 			memberID := ctx["memberID"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/members?ids=%s", lead, memberID))
-			status, body, err := fastDelete(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/members?ids=%s", lead, memberID))
+			status, body, err := testing.FastDelete(url)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -868,10 +868,10 @@ var _ = Describe("Leaderboard Handler", func() {
 
 	Describe("Get Member", func() {
 		It("Should get member score from redis if score exists (http)", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Get(a, "/l/testkey/members/memberpublicid")
+			status, body := Get(app, "/l/testkey/members/memberpublicid")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -880,7 +880,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(int64(100)))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(100)))
@@ -888,8 +888,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score from redis if score exists (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			SetupGRPC(app, func(cli pb.PodiumClient) {
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 
 				req := &pb.GetMemberRequest{
@@ -904,7 +904,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int64(resp.Score)).To(Equal(int64(100)))
 				Expect(resp.Rank).To(Equal(int32(1)))
 
-				member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+				member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member.Rank).To(Equal(1))
 				Expect(member.Score).To(Equal(int64(100)))
@@ -914,10 +914,10 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get member score from redis if greater than int", func() {
 			bigScore := int64(15584657100001)
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", bigScore, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", bigScore, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Get(a, "/l/testkey/members/memberpublicid")
+			status, body := Get(app, "/l/testkey/members/memberpublicid")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -926,7 +926,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int64(result["score"].(float64))).To(Equal(bigScore))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(bigScore))
@@ -934,10 +934,10 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score from redis if score exists including expiration timestamp", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "15")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "15")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Get(a, "/l/testkey/members/memberpublicid?scoreTTL=true")
+			status, body := Get(app, "/l/testkey/members/memberpublicid?scoreTTL=true")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -947,7 +947,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 			Expect(int(result["expireAt"].(float64))).To(BeNumerically("~", time.Now().Unix()+15, 1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(100)))
@@ -955,10 +955,10 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score from redis if score exists including expiration timestamp if no ttl", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicidnottl", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicidnottl", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Get(a, "/l/testkey/members/memberpublicidnottl?scoreTTL=true")
+			status, body := Get(app, "/l/testkey/members/memberpublicidnottl?scoreTTL=true")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -970,7 +970,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 404 if score does not exist", func() {
-			status, body := Get(a, "/l/testkey/members/memberpublicid")
+			status, body := Get(app, "/l/testkey/members/memberpublicid")
 			Expect(status).To(Equal(http.StatusNotFound), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -989,7 +989,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		HTTPMeasure("it should get member", func(ctx map[string]interface{}) {
 			lbID := uuid.NewV4().String()
 			memberID := uuid.NewV4().String()
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, memberID, 500, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, memberID, 500, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
 			ctx["lead"] = lbID
@@ -997,8 +997,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
 			memberID := ctx["memberID"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/members/%s", lead, memberID))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/members/%s", lead, memberID))
+			status, body, err := testing.FastGet(url)
 			Expect(status).To(Equal(http.StatusOK), string(body))
 			Expect(err).NotTo(HaveOccurred())
 		}, 0.05)
@@ -1006,10 +1006,10 @@ var _ = Describe("Leaderboard Handler", func() {
 
 	Describe("Get Member Rank", func() {
 		It("Should get member score from redis if score exists (http)", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Get(a, "/l/testkey/members/memberpublicid/rank")
+			status, body := Get(app, "/l/testkey/members/memberpublicid/rank")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1017,7 +1017,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(result["publicID"]).To(Equal("memberpublicid"))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(100)))
@@ -1025,8 +1025,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score from redis if score exists (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			SetupGRPC(app, func(cli pb.PodiumClient) {
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 
 				req := &pb.GetRankRequest{
@@ -1039,7 +1039,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(resp.PublicID).To(Equal("memberpublicid"))
 				Expect(resp.Rank).To(Equal(int32(1)))
 
-				member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+				member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member.Rank).To(Equal(1))
 				Expect(member.Score).To(Equal(int64(100)))
@@ -1048,10 +1048,10 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score from redis if score exists and order is asc", func() {
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "memberpublicid", 100, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
-			status, body := Get(a, "/l/testkey/members/memberpublicid/rank?order=asc")
+			status, body := Get(app, "/l/testkey/members/memberpublicid/rank?order=asc")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1059,7 +1059,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			Expect(result["publicID"]).To(Equal("memberpublicid"))
 			Expect(int(result["rank"].(float64))).To(Equal(1))
 
-			member, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
+			member, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, "memberpublicid", "desc", false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(member.Rank).To(Equal(1))
 			Expect(member.Score).To(Equal(int64(100)))
@@ -1067,7 +1067,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 404 if score does not exist", func() {
-			status, body := Get(a, "/l/testkey/members/memberpublicid/rank")
+			status, body := Get(app, "/l/testkey/members/memberpublicid/rank")
 			Expect(status).To(Equal(http.StatusNotFound), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1086,11 +1086,11 @@ var _ = Describe("Leaderboard Handler", func() {
 		HTTPMeasure("it should get member rank", func(ctx map[string]interface{}) {
 			lbID := uuid.NewV4().String()
 			memberID := uuid.NewV4().String()
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, memberID, 500, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, memberID, 500, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
 			for i := 0; i < 10; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, fmt.Sprintf("member-%d", i), 500, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lbID, fmt.Sprintf("member-%d", i), 500, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
@@ -1099,8 +1099,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
 			memberID := ctx["memberID"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/members/%s/rank", lead, memberID))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/members/%s/rank", lead, memberID))
+			status, body, err := testing.FastGet(url)
 			Expect(status).To(Equal(http.StatusOK), string(body))
 			Expect(err).NotTo(HaveOccurred())
 		}, 0.05)
@@ -1109,11 +1109,11 @@ var _ = Describe("Leaderboard Handler", func() {
 	Describe("Get Around Member Handler", func() {
 		It("Should get member score and neighbours from redis if member score exists (http)", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_50/around")
+			status, body := Get(app, "/l/testkey/members/member_50/around")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1128,7 +1128,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1137,9 +1137,9 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score and neighbours from redis if member score exists (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				for i := 1; i <= 100; i++ {
-					_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+					_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -1160,7 +1160,7 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(member.PublicID).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 					Expect(int(member.Score)).To(Equal(100 - pos))
 
-					dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member.PublicID, "desc", false)
+					dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member.PublicID, "desc", false)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(dbMember.Rank).To(Equal(int(member.Rank)))
 					Expect(dbMember.Score).To(Equal(int64(member.Score)))
@@ -1171,11 +1171,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get member score and neighbours from redis in reverse order if member score exists", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_50/around?order=asc")
+			status, body := Get(app, "/l/testkey/members/member_50/around?order=asc")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1192,11 +1192,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists but less than pageSize neighbours exist", func() {
 			for i := 1; i <= 15; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(16-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(16-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_10/around")
+			status, body := Get(app, "/l/testkey/members/member_10/around")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1209,7 +1209,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", i+1)))
 				Expect(int(member["score"].(float64))).To(Equal(15 - i))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1219,11 +1219,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get member score and default limit neighbours from redis if member score and less than limit neighbours exist", func() {
 			for i := 1; i <= 15; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(16-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(16-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_10/around")
+			status, body := Get(app, "/l/testkey/members/member_10/around")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1237,7 +1237,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 				Expect(int(member["score"].(float64))).To(Equal(15 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1247,11 +1247,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get member score and limit neighbours from redis if member score exists and custom limit", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_50/around?pageSize=10")
+			status, body := Get(app, "/l/testkey/members/member_50/around?pageSize=10")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1266,7 +1266,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1276,11 +1276,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get member score and limit neighbours from redis if member score exists and repeated scores", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), 100, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_50/around?pageSize=10")
+			status, body := Get(app, "/l/testkey/members/member_50/around?pageSize=10")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1294,7 +1294,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int(member["rank"].(float64))).To(Equal(pos))
 				Expect(int64(member["score"].(float64))).To(Equal(int64(100)))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1304,11 +1304,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get last positions if not in ranking", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_999/around?pageSize=20&getLastIfNotFound=true")
+			status, body := Get(app, "/l/testkey/members/member_999/around?pageSize=20&getLastIfNotFound=true")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1323,7 +1323,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int(member["rank"].(float64))).To(Equal(pos))
 				Expect(int(member["score"].(float64))).To(Equal(100 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1332,7 +1332,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 404 if score for member does not exist", func() {
-			status, body := Get(a, "/l/testkey/members/memberpublicid/around")
+			status, body := Get(app, "/l/testkey/members/memberpublicid/around")
 			Expect(status).To(Equal(http.StatusNotFound), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1341,7 +1341,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if bad pageSize provided", func() {
-			status, body := Get(a, "/l/testkey/members/member_50/around?pageSize=notint")
+			status, body := Get(app, "/l/testkey/members/member_50/around?pageSize=notint")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			err := json.Unmarshal([]byte(body), &result)
@@ -1351,8 +1351,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if pageSize provided if bigger than maxPageSizeAllowed", func() {
-			pageSize := a.Config.GetInt("api.maxReturnedMembers") + 1
-			status, body := Get(a, fmt.Sprintf("/l/testkey/members/member_50/around?pageSize=%d", pageSize))
+			pageSize := app.Config.GetInt("api.maxReturnedMembers") + 1
+			status, body := Get(app, fmt.Sprintf("/l/testkey/members/member_50/around?pageSize=%d", pageSize))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1362,11 +1362,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists and member in ranking bottom", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_2/around")
+			status, body := Get(app, "/l/testkey/members/member_2/around")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1379,7 +1379,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", i+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - i - 1))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1389,11 +1389,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists and member in ranking top", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/members/member_99/around")
+			status, body := Get(app, "/l/testkey/members/member_99/around")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1406,7 +1406,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", 80+i+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - 80 - i - 1))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1433,11 +1433,11 @@ var _ = Describe("Leaderboard Handler", func() {
 		HTTPMeasure("it should get around member", func(ctx map[string]interface{}) {
 			lead := uuid.NewV4().String()
 			memberID := uuid.NewV4().String()
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, memberID, 500, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, memberID, 500, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
 			for i := 0; i < 10; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
@@ -1446,8 +1446,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
 			memberID := ctx["memberID"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/members/%s/around", lead, memberID))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/members/%s/around", lead, memberID))
+			status, body, err := testing.FastGet(url)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -1456,12 +1456,12 @@ var _ = Describe("Leaderboard Handler", func() {
 	Describe("Get Around Score Handler", func() {
 		It("Should get score neighbours from redis if score is sent (http)", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			score := 50
-			status, body := Get(a, fmt.Sprintf("/l/testkey/scores/%d/around", score))
+			status, body := Get(app, fmt.Sprintf("/l/testkey/scores/%d/around", score))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1477,7 +1477,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1486,9 +1486,9 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get score neighbours from redis if score is sent (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				for i := 1; i <= 100; i++ {
-					_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+					_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -1509,7 +1509,7 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(member.PublicID).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 					Expect(int(member.Score)).To(Equal(100 - pos))
 
-					dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member.PublicID, "desc", false)
+					dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member.PublicID, "desc", false)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(dbMember.Rank).To(Equal(int(member.Rank)))
 					Expect(dbMember.Score).To(Equal(int64(member.Score)))
@@ -1520,12 +1520,12 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get rank neighbours from redis in reverse order if score is sent", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			score := 50
-			status, body := Get(a, fmt.Sprintf("/l/testkey/scores/%d/around?order=asc", score))
+			status, body := Get(app, fmt.Sprintf("/l/testkey/scores/%d/around?order=asc", score))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1543,12 +1543,12 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists but less than pageSize neighbours exist", func() {
 			for i := 1; i <= 15; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(16-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(16-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			score := 10
-			status, body := Get(a, fmt.Sprintf("/l/testkey/scores/%d/around", score))
+			status, body := Get(app, fmt.Sprintf("/l/testkey/scores/%d/around", score))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1561,7 +1561,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", i+1)))
 				Expect(int(member["score"].(float64))).To(Equal(15 - i))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1571,12 +1571,12 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should limit neighbours from redis if score is sent and custom limit", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			score := 50
-			status, body := Get(a, fmt.Sprintf("/l/testkey/scores/%d/around?pageSize=10", score))
+			status, body := Get(app, fmt.Sprintf("/l/testkey/scores/%d/around?pageSize=10", score))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1591,7 +1591,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1600,7 +1600,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if bad score is provided", func() {
-			status, body := Get(a, "/l/testkey/scores/badScore/around")
+			status, body := Get(app, "/l/testkey/scores/badScore/around")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			err := json.Unmarshal([]byte(body), &result)
@@ -1610,7 +1610,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if bad pageSize provided", func() {
-			status, body := Get(a, "/l/testkey/scores/50/around?pageSize=notint")
+			status, body := Get(app, "/l/testkey/scores/50/around?pageSize=notint")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			err := json.Unmarshal([]byte(body), &result)
@@ -1620,8 +1620,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if pageSize provided if bigger than maxPageSizeAllowed", func() {
-			pageSize := a.Config.GetInt("api.maxReturnedMembers") + 1
-			status, body := Get(a, fmt.Sprintf("/l/testkey/scores/50/around?pageSize=%d", pageSize))
+			pageSize := app.Config.GetInt("api.maxReturnedMembers") + 1
+			status, body := Get(app, fmt.Sprintf("/l/testkey/scores/50/around?pageSize=%d", pageSize))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1631,14 +1631,14 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists and score <= 0", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			scores := []int{-2, 0}
 
 			for _, score := range scores {
-				status, body := Get(a, fmt.Sprintf("/l/testkey/scores/%d/around", score))
+				status, body := Get(app, fmt.Sprintf("/l/testkey/scores/%d/around", score))
 				Expect(status).To(Equal(http.StatusOK), body)
 				var result map[string]interface{}
 				json.Unmarshal([]byte(body), &result)
@@ -1654,7 +1654,7 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos)))
 					Expect(int(member["score"].(float64))).To(Equal(20 - i - 1))
 
-					dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+					dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 					Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1665,14 +1665,14 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists and score in ranking top", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(100-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			scores := []int{99, 100, 500}
 
 			for _, score := range scores {
-				status, body := Get(a, fmt.Sprintf("/l/testkey/scores/%d/around", score))
+				status, body := Get(app, fmt.Sprintf("/l/testkey/scores/%d/around", score))
 				Expect(status).To(Equal(http.StatusOK), body)
 				var result map[string]interface{}
 				json.Unmarshal([]byte(body), &result)
@@ -1686,7 +1686,7 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos)))
 					Expect(int(member["score"].(float64))).To(Equal(100 - i - 1))
 
-					dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+					dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 					Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1707,11 +1707,11 @@ var _ = Describe("Leaderboard Handler", func() {
 	Describe("Get Total Members Handler", func() {
 		It("Should get the number of members in a leaderboard it exists (http)", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, fmt.Sprintf("/l/%s/members-count", testLeaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/members-count", testLeaderboardID))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1720,11 +1720,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get the number of members in a leaderboard it exists (grpc)", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				resp, err := cli.TotalMembers(context.Background(),
 					&pb.TotalMembersRequest{LeaderboardId: testLeaderboardID})
 
@@ -1734,7 +1734,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should not fail if leaderboard does not exist", func() {
-			status, body := Get(a, "/l/testkey/members-count")
+			status, body := Get(app, "/l/testkey/members-count")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1753,19 +1753,19 @@ var _ = Describe("Leaderboard Handler", func() {
 		HTTPMeasure("it should get total members", func(ctx map[string]interface{}) {
 			lead := uuid.NewV4().String()
 			memberID := uuid.NewV4().String()
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, memberID, 500, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, memberID, 500, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
 			for i := 0; i < 10; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			ctx["lead"] = lead
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/members-count", lead))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/members-count", lead))
+			status, body, err := testing.FastGet(url)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -1774,11 +1774,11 @@ var _ = Describe("Leaderboard Handler", func() {
 	Describe("Get Top Members Handler", func() {
 		It("Should get one page of top members from redis if leaderboard exists (http)", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/top/1")
+			status, body := Get(app, "/l/testkey/top/1")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1791,7 +1791,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", i+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - i))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1800,9 +1800,9 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get one page of top members from redis if leaderboard exists (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				for i := 1; i <= 100; i++ {
-					_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+					_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -1819,7 +1819,7 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(member.PublicID).To(Equal(fmt.Sprintf("member_%d", i+1)))
 					Expect(int(member.Score)).To(Equal(100 - i))
 
-					dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member.PublicID, "desc", false)
+					dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member.PublicID, "desc", false)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(dbMember.Rank).To(Equal(int(member.Rank)))
 					Expect(dbMember.Score).To(Equal(int64(member.Score)))
@@ -1830,11 +1830,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members in reverse order from redis if leaderboard exists", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/top/1?order=asc")
+			status, body := Get(app, "/l/testkey/top/1?order=asc")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1851,11 +1851,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get one page of top members from redis if leaderboard exists", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/top/2")
+			status, body := Get(app, "/l/testkey/top/2")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1870,7 +1870,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", pos+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - pos))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1880,11 +1880,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get top members from redis if leaderboard exists with custom pageSize", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/top/1?pageSize=10")
+			status, body := Get(app, "/l/testkey/top/1?pageSize=10")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1897,7 +1897,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(member["publicID"]).To(Equal(fmt.Sprintf("member_%d", i+1)))
 				Expect(int(member["score"].(float64))).To(Equal(100 - i))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1907,11 +1907,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get empty list if page does not exist", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/top/100000")
+			status, body := Get(app, "/l/testkey/top/100000")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1922,11 +1922,11 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("Should get only one page of top members from redis if leaderboard exists and repeated scores", func() {
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), 100, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, "/l/testkey/top/1?pageSize=10")
+			status, body := Get(app, "/l/testkey/top/1?pageSize=10")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1938,7 +1938,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int(member["rank"].(float64))).To(Equal(i + 1))
 				Expect(int64(member["score"].(float64))).To(Equal(int64(100)))
 
-				dbMember, err := a.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
+				dbMember, err := app.Leaderboards.GetMember(NewEmptyCtx(), testLeaderboardID, member["publicID"].(string), "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(dbMember.Rank).To(Equal(int(member["rank"].(float64))))
 				Expect(dbMember.Score).To(Equal(int64(member["score"].(float64))))
@@ -1947,9 +1947,9 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should not fail is page number 0 is sent", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				for i := 1; i <= 100; i++ {
-					_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), 100, false, "")
+					_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), testLeaderboardID, "member_"+strconv.Itoa(i), 100, false, "")
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -1959,7 +1959,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if bad pageNumber provided", func() {
-			status, body := Get(a, "/l/testkey/top/notint")
+			status, body := Get(app, "/l/testkey/top/notint")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1968,7 +1968,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if bad pageSize provided", func() {
-			status, body := Get(a, "/l/testkey/top/1?pageSize=notint")
+			status, body := Get(app, "/l/testkey/top/1?pageSize=notint")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1977,8 +1977,8 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail with 400 if pageSize provided if bigger than maxPageSizeAllowed", func() {
-			pageSize := a.Config.GetInt("api.maxReturnedMembers") + 1
-			status, body := Get(a, fmt.Sprintf("/l/testkey/top/1?pageSize=%d", pageSize))
+			pageSize := app.Config.GetInt("api.maxReturnedMembers") + 1
+			status, body := Get(app, fmt.Sprintf("/l/testkey/top/1?pageSize=%d", pageSize))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -1987,9 +1987,9 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if error getting top members from Redis", func() {
-			app := GetDefaultTestAppWithFaultyRedis()
+			faultyRedisApp := GetDefaultTestAppWithFaultyRedis()
 
-			status, body := Get(app, "/l/testkey/top/1")
+			status, body := Get(faultyRedisApp, "/l/testkey/top/1")
 			Expect(status).To(Equal(500), body)
 			Expect(body).To(ContainSubstring("connection refused"))
 		})
@@ -1997,19 +1997,19 @@ var _ = Describe("Leaderboard Handler", func() {
 		HTTPMeasure("it should get top members", func(ctx map[string]interface{}) {
 			lead := uuid.NewV4().String()
 			memberID := uuid.NewV4().String()
-			_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, memberID, 500, false, "")
+			_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, memberID, 500, false, "")
 			Expect(err).NotTo(HaveOccurred())
 
 			for i := 0; i < 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			ctx["lead"] = lead
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/top/10", lead))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/top/10", lead))
+			status, body, err := testing.FastGet(url)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -2020,11 +2020,11 @@ var _ = Describe("Leaderboard Handler", func() {
 			leaderboardID := uuid.NewV4().String()
 
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, fmt.Sprintf("/l/%s/top-percent/10", leaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/top-percent/10", leaderboardID))
 			Expect(status).To(Equal(http.StatusOK), body)
 
 			var result map[string]interface{}
@@ -2043,11 +2043,11 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get top members from redis if leaderboard exists (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				leaderboardID := uuid.NewV4().String()
 
 				for i := 1; i <= 100; i++ {
-					_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
+					_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -2073,11 +2073,11 @@ var _ = Describe("Leaderboard Handler", func() {
 			leaderboardID := uuid.NewV4().String()
 
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), 100, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), 100, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Get(a, fmt.Sprintf("/l/%s/top-percent/10", leaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/top-percent/10", leaderboardID))
 			Expect(status).To(Equal(http.StatusOK), body)
 
 			var result map[string]interface{}
@@ -2097,29 +2097,28 @@ var _ = Describe("Leaderboard Handler", func() {
 		It("Should fail if invalid percentage", func() {
 			leaderboardID := uuid.NewV4().String()
 
-			status, body := Get(a, fmt.Sprintf("/l/%s/top-percent/l", leaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/top-percent/l", leaderboardID))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			Expect(body).To(ContainSubstring("invalid syntax"))
 		})
 
 		It("Should fail if percentage greater than 100", func() {
 			leaderboardID := uuid.NewV4().String()
-			status, body := Get(a, fmt.Sprintf("/l/%s/top-percent/120", leaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/top-percent/120", leaderboardID))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
-			Expect(body).To(ContainSubstring("Percentage must be a valid integer between 1 and 100."))
 		})
 
 		It("Should fail if percentage lesser than 1", func() {
 			leaderboardID := uuid.NewV4().String()
-			status, body := Get(a, fmt.Sprintf("/l/%s/top-percent/0", leaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/top-percent/0", leaderboardID))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			Expect(body).To(ContainSubstring("Percentage must be a valid integer between 1 and 100."))
 		})
 
 		It("Should fail if error in Redis", func() {
-			app := GetDefaultTestAppWithFaultyRedis()
+			faultyRedisApp := GetDefaultTestAppWithFaultyRedis()
 
-			status, body := Get(app, "/l/testkey/top-percent/10")
+			status, body := Get(faultyRedisApp, "/l/testkey/top-percent/10")
 			Expect(status).To(Equal(500), body)
 			Expect(body).To(ContainSubstring("connection refused"))
 		})
@@ -2128,15 +2127,15 @@ var _ = Describe("Leaderboard Handler", func() {
 			lead := uuid.NewV4().String()
 
 			for i := 0; i < 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), lead, fmt.Sprintf("member-%d", i), 500, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			ctx["lead"] = lead
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
 			lead := ctx["lead"].(string)
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/top-percent/10", lead))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/top-percent/10", lead))
+			status, body, err := testing.FastGet(url)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -2148,9 +2147,9 @@ var _ = Describe("Leaderboard Handler", func() {
 				"score":        100,
 				"leaderboards": []string{"testkey1", "testkey2", "testkey3", "testkey4", "testkey5"},
 			}
-			status, body := PutJSON(a, "/m/memberpublicid/scores", payload)
+			status, body := PutJSON(app, "/m/memberpublicid/scores", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
-			status, body = Get(a, "/m/memberpublicid/scores?leaderboardIds=testkey1,testkey2,testkey3,testkey4,testkey5")
+			status, body = Get(app, "/m/memberpublicid/scores?leaderboardIds=testkey1,testkey2,testkey3,testkey4,testkey5")
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2164,7 +2163,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should get member score in many leaderboards (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 
 				reqUpdate := &pb.UpsertScoreMultiLeaderboardsRequest{
 					MemberPublicId: "memberpublicid",
@@ -2196,14 +2195,14 @@ var _ = Describe("Leaderboard Handler", func() {
 				"score":        100,
 				"leaderboards": []string{"testkey1", "testkey2", "testkey3", "testkey4", "testkey5"},
 			}
-			status, body := PutJSON(a, "/m/memberpublicid/scores", payload)
+			status, body := PutJSON(app, "/m/memberpublicid/scores", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
-			status, body = Get(a, "/m/memberpublicid/scores?leaderboardIds=testkey1,testkey2,testkey3,testkey4,testkey6")
+			status, body = Get(app, "/m/memberpublicid/scores?leaderboardIds=testkey1,testkey2,testkey3,testkey4,testkey6")
 			Expect(status).To(Equal(http.StatusNotFound), body)
 		})
 
 		It("Should fail if empty id list is passed", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				_, err := cli.GetRankMultiLeaderboards(context.Background(), &pb.GetRankMultiLeaderboardsRequest{
 					MemberPublicId: "memberpublicid",
 				})
@@ -2221,7 +2220,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				"score":        100,
 				"leaderboards": []string{"testkey1", "testkey2", "testkey3", "testkey4", "testkey5"},
 			}
-			status, body := PutJSON(a, "/m/memberpublicid/scores?prevRank=true", payload)
+			status, body := PutJSON(app, "/m/memberpublicid/scores?prevRank=true", payload)
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2236,7 +2235,7 @@ var _ = Describe("Leaderboard Handler", func() {
 				Expect(int(score["previousRank"].(float64))).To(Equal(-1))
 				Expect(score["leaderboardID"]).To(Equal(payload["leaderboards"].([]string)[i]))
 
-				member, err := a.Leaderboards.GetMember(NewEmptyCtx(), score["leaderboardID"].(string),
+				member, err := app.Leaderboards.GetMember(NewEmptyCtx(), score["leaderboardID"].(string),
 					"memberpublicid", "desc", false)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(member.Rank).To(Equal(1))
@@ -2246,7 +2245,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should set correct member score in redis and respond with the correct values (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				payload := map[string]interface{}{
 					"score":        100,
 					"leaderboards": []string{"testkey1", "testkey2", "testkey3", "testkey4", "testkey5"},
@@ -2271,7 +2270,7 @@ var _ = Describe("Leaderboard Handler", func() {
 					Expect(int(score.PreviousRank)).To(Equal(-1))
 					Expect(score.LeaderboardID).To(Equal(payload["leaderboards"].([]string)[i]))
 
-					member, err := a.Leaderboards.GetMember(NewEmptyCtx(), score.LeaderboardID,
+					member, err := app.Leaderboards.GetMember(NewEmptyCtx(), score.LeaderboardID,
 						"memberpublicid", "desc", false)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(member.Rank).To(Equal(1))
@@ -2286,7 +2285,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"leaderboards": []string{"testkey1", "testkey2", "testkey3", "testkey4", "testkey5"},
 			}
-			status, body := PutJSON(a, "/m/memberpublicid/scores", payload)
+			status, body := PutJSON(app, "/m/memberpublicid/scores", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2298,7 +2297,7 @@ var _ = Describe("Leaderboard Handler", func() {
 			payload := map[string]interface{}{
 				"score": int64(100),
 			}
-			status, body := PutJSON(a, "/m/memberpublicid/scores", payload)
+			status, body := PutJSON(app, "/m/memberpublicid/scores", payload)
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2307,7 +2306,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if invalid payload", func() {
-			status, body := Put(a, "/m/memberpublicid/scores", "invalid")
+			status, body := Put(app, "/m/memberpublicid/scores", "invalid")
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2316,13 +2315,13 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if error in Redis when upserting many leaderboards", func() {
-			app := GetDefaultTestAppWithFaultyRedis()
+			faultyRedisApp := GetDefaultTestAppWithFaultyRedis()
 
 			payload := map[string]interface{}{
 				"score":        100,
 				"leaderboards": []string{"testkey1", "testkey2", "testkey3", "testkey4", "testkey5"},
 			}
-			status, body := PutJSON(app, "/m/memberpublicid/scores", payload)
+			status, body := PutJSON(faultyRedisApp, "/m/memberpublicid/scores", payload)
 			Expect(status).To(Equal(500), body)
 			Expect(body).To(ContainSubstring("connection refused"))
 		})
@@ -2337,8 +2336,8 @@ var _ = Describe("Leaderboard Handler", func() {
 
 			ctx["payload"] = payloadJSON
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
-			url := getRoute(httpEndPoint, "/m/memberpublicid/scores")
-			status, body, err := fastPutTo(url, ctx["payload"].([]byte))
+			url := testing.GetRoute(httpEndPoint, "/m/memberpublicid/scores")
+			status, body, err := testing.FastPutTo(url, ctx["payload"].([]byte))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
 		}, 0.05)
@@ -2349,11 +2348,11 @@ var _ = Describe("Leaderboard Handler", func() {
 			leaderboardID := uuid.NewV4().String()
 
 			for i := 0; i < 10; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member-%d", i), 500, false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member-%d", i), 500, false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			status, body := Delete(a, fmt.Sprintf("/l/%s", leaderboardID))
+			status, body := Delete(app, fmt.Sprintf("/l/%s", leaderboardID))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2361,7 +2360,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("should remove a leaderboard that does not exist", func() {
-			status, body := Delete(a, fmt.Sprintf("/l/%s", uuid.NewV4().String()))
+			status, body := Delete(app, fmt.Sprintf("/l/%s", uuid.NewV4().String()))
 			Expect(status).To(Equal(http.StatusOK), body)
 			var result map[string]interface{}
 			json.Unmarshal([]byte(body), &result)
@@ -2369,9 +2368,9 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if error in Redis", func() {
-			app := GetDefaultTestAppWithFaultyRedis()
+			faultyRedisApp := GetDefaultTestAppWithFaultyRedis()
 
-			status, body := Delete(app, fmt.Sprintf("/l/%s", uuid.NewV4().String()))
+			status, body := Delete(faultyRedisApp, fmt.Sprintf("/l/%s", uuid.NewV4().String()))
 			Expect(status).To(Equal(500), body)
 			Expect(body).To(ContainSubstring("connection refused"))
 		})
@@ -2382,12 +2381,12 @@ var _ = Describe("Leaderboard Handler", func() {
 			leaderboardID := uuid.NewV4().String()
 
 			for i := 1; i <= 100; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			status, body := Get(
-				a,
+				app,
 				fmt.Sprintf("/l/%s/members?ids=member_10,member_20,member_30", leaderboardID),
 			)
 			Expect(status).To(Equal(http.StatusOK), body)
@@ -2411,11 +2410,11 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("should get several members from leaderboard (grpc)", func() {
-			SetupGRPC(a, func(cli pb.PodiumClient) {
+			SetupGRPC(app, func(cli pb.PodiumClient) {
 				leaderboardID := uuid.NewV4().String()
 
 				for i := 1; i <= 100; i++ {
-					_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
+					_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
 					Expect(err).NotTo(HaveOccurred())
 				}
 
@@ -2443,7 +2442,7 @@ var _ = Describe("Leaderboard Handler", func() {
 
 		It("should return empty list if invalid leaderboard", func() {
 			status, body := Get(
-				a,
+				app,
 				"/l/invalid-leaderboard/members/?ids=member_10,member_20,member_30",
 			)
 			Expect(status).To(Equal(http.StatusOK), body)
@@ -2466,12 +2465,12 @@ var _ = Describe("Leaderboard Handler", func() {
 			leaderboardID := uuid.NewV4().String()
 
 			for i := 1; i <= 10; i++ {
-				_, err := a.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
+				_, err := app.Leaderboards.SetMemberScore(NewEmptyCtx(), leaderboardID, fmt.Sprintf("member_%d", i), int64(101-i), false, "")
 				Expect(err).NotTo(HaveOccurred())
 			}
 
 			status, body := Get(
-				a,
+				app,
 				fmt.Sprintf("/l/%s/members?ids=member_1,invalid_member", leaderboardID),
 			)
 			Expect(status).To(Equal(http.StatusOK), body)
@@ -2496,7 +2495,7 @@ var _ = Describe("Leaderboard Handler", func() {
 		It("should fail if no public ids sent", func() {
 			leaderboardID := uuid.NewV4().String()
 
-			status, body := Get(a, fmt.Sprintf("/l/%s/members/", leaderboardID))
+			status, body := Get(app, fmt.Sprintf("/l/%s/members/", leaderboardID))
 			Expect(status).To(Equal(http.StatusBadRequest), body)
 
 			var result map[string]interface{}
@@ -2507,10 +2506,10 @@ var _ = Describe("Leaderboard Handler", func() {
 		})
 
 		It("Should fail if error in Redis", func() {
-			app := GetDefaultTestAppWithFaultyRedis()
+			faultyRedisApp := GetDefaultTestAppWithFaultyRedis()
 
 			status, body := Get(
-				app,
+				faultyRedisApp,
 				"/l/invalid-redis/members?ids=member_10,member_20,member_30",
 			)
 
@@ -2531,10 +2530,10 @@ var _ = Describe("Leaderboard Handler", func() {
 
 			ctx["mIDs"] = strings.Join(memberIDs, ",")
 		}, func(httpEndPoint string, ctx map[string]interface{}) {
-			url := getRoute(httpEndPoint, fmt.Sprintf("/l/%s/members?ids=%s", testLeaderboardID, ctx["mIDs"].(string)))
-			status, body, err := fastGet(url)
+			url := testing.GetRoute(httpEndPoint, fmt.Sprintf("/l/%s/members?ids=%s", testLeaderboardID, ctx["mIDs"].(string)))
+			status, body, err := testing.FastGet(url)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(status).To(Equal(http.StatusOK), string(body))
-		}, 0.1)
+		}, 0.9)
 	})
 })

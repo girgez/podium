@@ -3,10 +3,14 @@ healthcheck:
 
 redis:
   host: localhost
-  port: 1212
+  port: 6379
   password: ""
   db: 0
-  connectionTimeout: 200
+
+faultyRedis:
+  host: "localhost"
+  port: 12345
+  db: 0
 
 jaeger:
   disabled: false
